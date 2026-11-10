@@ -3,6 +3,8 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
+import warnings
 from contextlib import nullcontext
 from typing import Literal
 
@@ -15,6 +17,7 @@ import click
 from click import Option
 from click import UNPROCESSED
 from click._utils import UNSET
+from click.parser import _split_opt
 from click.testing import CliRunner
 
 
@@ -96,6 +99,34 @@ def test_help_spec(param_decls, kwargs, hidden, expected):
         assert opt.get_help_record(ctx)[0] == expected
 
 
+@pytest.mark.parametrize(
+    ("param_decls", "expected_spec", "expected_name"),
+    [
+        (["-t", "--times"], "--times", "times"),
+        (["--times", "-t"], "--times", "times"),
+        (["-t"], "-t", "t"),
+        (["-t", "--times", "--repeat"], "--times", "times"),
+        (["--color/--no-color"], "--color", "color"),
+        (["/debug;/no-debug"], "/debug", "debug"),
+    ],
+)
+def test_spec(param_decls, expected_spec, expected_name):
+    """The spec is the declaration the name was derived from, so the longest
+    prefix wins over declaration order.
+    """
+    opt = click.Option(param_decls)
+    assert opt.spec == expected_spec
+    assert opt.name == expected_name
+    assert _split_opt(opt.spec)[1].replace("-", "_").lower() == opt.name
+
+
+def test_spec_with_explicit_name():
+    """An explicit name declaration leaves the spec to the remaining flags."""
+    opt = click.Option(["--times", "repeat_count"])
+    assert opt.spec == "--times"
+    assert opt.name == "repeat_count"
+
+
 @pytest.mark.parametrize("deprecated", [True, "USE B INSTEAD"])
 def test_deprecated_warning(runner, deprecated):
     @click.command()
@@ -112,7 +143,7 @@ def test_deprecated_warning(runner, deprecated):
 
     result = runner.invoke(cli, ["--my-option", "hello"])
     assert result.exit_code == 0, result.output
-    assert "option 'my_option' is deprecated" in result.output
+    assert "option '--my-option' is deprecated" in result.output
 
     if isinstance(deprecated, str):
         assert deprecated in result.output
@@ -233,9 +264,8 @@ def test_multiple_required(runner):
         (True, 1, [1.1, 2.2], (1.1, 2.2)),
         (True, 1, ["1", "2"], ("1", "2")),
         (True, 1, [None, None], (None, None)),
-        # Contrary to list or tuples, native Python types not supported by Click are
-        # not recognized and are converted to the default format: tuple of strings.
-        # Refs: https://github.com/pallets/click/issues/3036
+        # Contrary to list or tuples, native Python types not supported by Click are not
+        # recognized and are converted to the default format: tuple of strings.
         (True, 1, {1, 2}, ("1", "2")),
         (True, 1, frozenset([1, 2]), ("1", "2")),
         (True, 1, {1: "a", 2: "b"}, ("1", "2")),
@@ -456,10 +486,7 @@ def test_multiple_envvar(runner):
 
 
 def test_envvar_container_type(runner):
-    """Env vars are plain strings, so a container type splits them character-wise.
-
-    Refs: https://github.com/pallets/click/issues/3036
-    """
+    """Env vars are plain strings, so a container type splits them character-wise."""
 
     @click.command()
     @click.option("--x", envvar="X", type=frozenset)
@@ -636,10 +663,7 @@ def test_show_default_default_map(runner):
 
 
 def test_show_default_container_defaults(runner):
-    """Container defaults are rendered through ``str()`` in the help output.
-
-    Refs: https://github.com/pallets/click/issues/3036
-    """
+    """Container defaults are rendered through ``str()`` in the help output."""
 
     @click.command()
     @click.option("--a", default=frozenset(["git"]), type=frozenset, show_default=True)
@@ -687,10 +711,8 @@ def test_multiple_default_composite_type():
 def test_type_from_default_container(default):
     """Container defaults have no native Click type and fall back to STRING.
 
-    The documented "if no type is provided, the type of the default value is
-    used" rule does not apply to ``set``, ``frozenset`` or ``dict`` defaults.
-
-    Refs: https://github.com/pallets/click/issues/3036
+    This matches the documented rule: the type of the default value is used only if
+    Click recognizes it, and it does not recognize ``set``, ``frozenset`` or ``dict``.
     """
     opt = click.Option(["-a"], default=default)
     assert opt.type is click.STRING
@@ -794,7 +816,7 @@ def test_file_type_help_default():
     getting the default value.
     """
     option = click.Option(
-        ["--in"], type=click.File(), default=__file__, show_default=True
+        ["--infile"], type=click.File(), default=__file__, show_default=True
     )
     context = click.Context(click.Command("test"))
     assert option.get_help_extra(context) == {"default": __file__}
@@ -811,6 +833,132 @@ def test_toupper_envvar_prefix(runner):
     result = runner.invoke(cmd, [], auto_envvar_prefix="test", env={"TEST_ARG": "foo"})
     assert not result.exception
     assert result.output == "foo\n"
+
+
+# CPython upper-cases every key of ``os.environ`` when ``os.name == "nt"``,
+# see ``os._createenviron``. ``CliRunner`` writes the ``env`` mapping through
+# ``os.environ`` and ``Parameter.resolve_envvar_value`` reads it back the same
+# way, so on Windows a variable answers to every spelling of its name and
+# elsewhere to exactly one. Both halves are asserted rather than skipped: the
+# difference is the behaviour being pinned. See pallets/click#2483.
+ENV_NAMES_ARE_CASE_INSENSITIVE = sys.platform == "win32"
+
+
+def test_auto_envvar_uses_the_transformed_name(runner):
+    """The auto envvar is built from the name, which the transform lower-cased."""
+
+    @click.command()
+    @click.option("--Foo-Bar")
+    def cmd(foo_bar):
+        click.echo(foo_bar)
+
+    result = runner.invoke(
+        cmd, [], auto_envvar_prefix="TEST", env={"TEST_FOO_BAR": "foo"}
+    )
+    assert not result.exception
+    assert result.output == "foo\n"
+
+
+def test_auto_envvar_ignores_decl_case(runner):
+    """The case written in the declaration never reaches the auto envvar."""
+
+    @click.command()
+    @click.option("--Foo-Bar")
+    def cmd(foo_bar):
+        click.echo(repr(foo_bar))
+
+    result = runner.invoke(
+        cmd, [], auto_envvar_prefix="TEST", env={"TEST_Foo_Bar": "foo"}
+    )
+    assert not result.exception
+    expect = "'foo'" if ENV_NAMES_ARE_CASE_INSENSITIVE else "None"
+    assert result.output == f"{expect}\n"
+
+
+def test_auto_envvar_prefix_is_upper_cased(runner):
+    """A lower-case prefix reaches an upper-case variable, and only that one."""
+
+    @click.command()
+    @click.option("--flag/--no-flag")
+    def cmd(flag):
+        click.echo(repr(flag))
+
+    result = runner.invoke(cmd, [], auto_envvar_prefix="yo", env={"YO_FLAG": "1"})
+    assert not result.exception
+    assert result.output == "True\n"
+
+    result = runner.invoke(cmd, [], auto_envvar_prefix="yo", env={"yo_FLAG": "1"})
+    assert not result.exception
+    assert result.output == f"{ENV_NAMES_ARE_CASE_INSENSITIVE}\n"
+
+
+def test_auto_envvar_flattens_name_case(runner):
+    """Two names differing only by case share one auto envvar."""
+    with pytest.warns(DeprecationWarning, match="lower cases an explicit name"):
+
+        @click.command()
+        @click.option("--foo-bar")
+        @click.option("--other", "Foo_Bar")
+        def cmd(**kwargs):
+            click.echo(repr(sorted(kwargs.items())))
+
+    assert [p.name for p in cmd.params if p.name] == ["foo_bar", "Foo_Bar"]
+
+    result = runner.invoke(
+        cmd, [], auto_envvar_prefix="TEST", env={"TEST_FOO_BAR": "foo"}
+    )
+    assert not result.exception
+    assert result.output == "[('Foo_Bar', 'foo'), ('foo_bar', 'foo')]\n"
+
+
+def test_auto_envvar_upper_can_change_length(runner):
+    """Deriving the envvar is not the inverse of deriving the name."""
+
+    @click.command()
+    @click.option("--ẞ")
+    def cmd(**kwargs):
+        click.echo(repr(kwargs))
+
+    result = runner.invoke(cmd, [], auto_envvar_prefix="TEST", env={"TEST_SS": "foo"})
+    assert not result.exception
+    assert result.output == "{'ß': 'foo'}\n"
+
+
+@pytest.mark.parametrize(
+    ("env", "expect"),
+    [
+        pytest.param({"ArG": "foo"}, "'foo'", id="exact"),
+        pytest.param({"ARG": "foo"}, "None", id="upper"),
+        pytest.param({"arg": "foo"}, "None", id="lower"),
+    ],
+)
+def test_explicit_envvar_case_sensitivity(runner, env, expect):
+    """An explicitly named envvar keeps the case it was registered with."""
+
+    @click.command()
+    @click.option("--arg", envvar="ArG")
+    def cmd(arg):
+        click.echo(repr(arg))
+
+    result = runner.invoke(cmd, [], env=env)
+    assert not result.exception
+    if ENV_NAMES_ARE_CASE_INSENSITIVE:
+        expect = "'foo'"
+    assert result.output == f"{expect}\n"
+
+
+@pytest.mark.parametrize("name", ("FlAg", "sUper"))
+def test_explicit_envvar_list_keeps_each_spelling(runner, name):
+    """Every name of an envvar list is matched with its own case."""
+
+    @click.command()
+    @click.option("--flag/--no-flag", envvar=["FlAg", "sUper"])
+    def cmd(flag):
+        click.echo(repr(flag))
+
+    result = runner.invoke(cmd, [], env={name: "1"})
+    assert not result.exception
+    assert result.output == "True\n"
 
 
 def test_nargs_envvar(runner):
@@ -873,6 +1021,23 @@ def test_show_envvar_auto_prefix_dash_in_command(runner):
     result = runner.invoke(cli, ["foo-bar", "--help"], auto_envvar_prefix="TEST")
     assert not result.exception
     assert "TEST_FOO_BAR_BAZ" in result.output
+
+
+@pytest.mark.parametrize("envvar", [None, [], ""])
+@pytest.mark.parametrize(
+    ("auto_envvar_prefix", "expected"),
+    [
+        (None, "  --units TEXT\n"),
+        ("WEATHER", "  --units TEXT  [env var: WEATHER_UNITS]\n"),
+    ],
+)
+def test_show_envvar_empty(runner, envvar, auto_envvar_prefix, expected):
+    """An empty ``envvar`` shows the same help as no ``envvar``."""
+    option = click.Option(["--units"], envvar=envvar, show_envvar=True)
+    cli = click.Command("cli", params=[option])
+    result = runner.invoke(cli, ["--help"], auto_envvar_prefix=auto_envvar_prefix)
+    assert not result.exception
+    assert expected in result.output
 
 
 def test_custom_validation(runner):
@@ -1018,6 +1183,25 @@ def test_missing_envvar(runner):
     assert "Error: Missing option '--foo'." in result.output
 
 
+@pytest.mark.parametrize(
+    ("envvar", "expected"),
+    [
+        ("UNITS", "'--units' (env var: 'UNITS')"),
+        (["UNITS"], "'--units' (env var: 'UNITS')"),
+        (["WEATHER_UNITS", "UNITS"], "'--units' (env var: 'WEATHER_UNITS', 'UNITS')"),
+        (("WEATHER_UNITS", "UNITS"), "'--units' (env var: 'WEATHER_UNITS', 'UNITS')"),
+        ([], "'--units'"),
+        ("", "'--units'"),
+    ],
+)
+def test_missing_envvar_sequence(runner, envvar, expected):
+    """The error hint names each variable of a sequence ``envvar``."""
+    option = click.Option(["--units"], envvar=envvar, show_envvar=True, required=True)
+    result = runner.invoke(click.Command("cli", params=[option]))
+    assert result.exit_code == 2
+    assert f"Error: Missing option {expected}." in result.output
+
+
 def test_case_insensitive_choice(runner):
     @click.command()
     @click.option("--foo", type=click.Choice(["Orange", "Apple"], case_sensitive=False))
@@ -1158,7 +1342,7 @@ def test_option_custom_class_can_override_type_cast_value_and_never_sees_unset(
 
 
 def test_option_custom_class_reusable(runner):
-    """Ensure we can reuse a custom class option. See Issue #926"""
+    """Ensure we can reuse a custom class option."""
 
     class CustomOption(click.Option):
         def get_help_record(self, ctx):
@@ -1273,6 +1457,20 @@ def test_aliases_for_flags(runner):
         (["-c", "-a", "--cantaloupe", "-b", "--banana", "--apple"], "cantaloupe"),
         (["--from", "-f", "_from"], "_from"),
         (["--return", "-r", "_ret"], "_ret"),
+        # A name derived from an option string is lower-cased.
+        (["--Foo-Bar"], "foo_bar"),
+        (["--FOO-BAR", "-F"], "foo_bar"),
+        # An identifier declaration goes through the same transform.
+        (["--foo-bar", "-f", "explicit_name"], "explicit_name"),
+        # Underscores survive, and every dash past the prefix becomes one.
+        (["--foo__bar"], "foo__bar"),
+        (["--foo--bar"], "foo__bar"),
+        (["--_foo"], "_foo"),
+        (["--__foo"], "__foo"),
+        (["---foo"], "_foo"),
+        (["-_"], "_"),
+        # A digit is only refused in the leading position.
+        (["--foo-0"], "foo_0"),
     ],
 )
 def test_option_names(runner, option_args, expected):
@@ -1287,6 +1485,125 @@ def test_option_names(runner, option_args, expected):
         if form.startswith("-"):
             result = runner.invoke(cmd, [form])
             assert result.output == "True\n"
+
+
+def test_option_name_case_transform_can_collide(runner):
+    """Two declarations that differ can transform to one name, with no warning."""
+
+    @click.command()
+    @click.option("--\N{KELVIN SIGN}")
+    @click.option("--k")
+    def cmd(**kwargs):
+        click.echo(repr(kwargs))
+
+    assert [p.name for p in cmd.params] == ["k", "k"]
+
+    result = runner.invoke(cmd, ["--\N{KELVIN SIGN}", "kelvin", "--k", "ascii"])
+    assert not result.exception
+    assert result.output == "{'k': 'ascii'}\n"
+
+
+def test_option_name_case_variants_share_one_parameter(runner):
+    """Case variants of one option collapse onto a single parameter."""
+
+    @click.command()
+    @click.option("--foo-bar")
+    @click.option("--Foo-Bar")
+    @click.option("--FOO-BAR")
+    def cmd(**kwargs):
+        click.echo(repr(kwargs))
+
+    assert [p.name for p in cmd.params] == ["foo_bar"] * 3
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = runner.invoke(cmd, ["--help"], catch_exceptions=False)
+
+    assert not [w for w in caught if issubclass(w.category, UserWarning)]
+    for spelling in ("--foo-bar", "--Foo-Bar", "--FOO-BAR"):
+        assert spelling in result.output
+
+    for spelling, value in (("--foo-bar", "a"), ("--Foo-Bar", "b"), ("--FOO-BAR", "c")):
+        result = runner.invoke(cmd, [spelling, value])
+        assert not result.exception
+        assert result.output == f"{{'foo_bar': {value!r}}}\n"
+
+    # Sharing one slot, the last spelling on the command line wins.
+    result = runner.invoke(cmd, ["--foo-bar", "a", "--FOO-BAR", "c"])
+    assert result.output == "{'foo_bar': 'c'}\n"
+
+
+def test_option_name_keeps_its_normalization_form(runner):
+    """A composed and a decomposed declaration are two distinct parameters."""
+    decomposed = "cafe\N{COMBINING ACUTE ACCENT}"
+    composed = unicodedata.normalize("NFC", decomposed)
+
+    @click.command()
+    @click.option(f"--{composed}")
+    @click.option(f"--{decomposed}")
+    def cmd(**kwargs):
+        click.echo(repr(sorted(kwargs)))
+
+    assert [p.name for p in cmd.params] == [composed, decomposed]
+
+    result = runner.invoke(cmd, [])
+    assert not result.exception
+    assert result.output == f"['{decomposed}', '{composed}']\n"
+
+
+def test_option_name_must_be_an_identifier():
+    """A short option is the one refused shape an argument cannot be written as."""
+    with pytest.raises(TypeError, match="Could not determine name"):
+        click.Option(["-0"])
+
+
+def test_option_prompt_still_guards_against_a_nameless_option():
+    """An unexposed option can still be named ``""``, which ``prompt=True`` refuses."""
+    with pytest.warns(DeprecationWarning, match="not a valid Python identifier"):
+        with pytest.raises(TypeError, match="'name' is required with 'prompt=True'"):
+            click.Option(["--0-file"], expose_value=False, prompt=True)
+
+
+def test_option_name_check_applies_when_not_exposed():
+    """An unexposed option is named ``""``, and says Click 9.0 will refuse it."""
+    with pytest.warns(DeprecationWarning, match="not a valid Python identifier"):
+        assert click.Option(["--0foo"], expose_value=False).name == ""
+
+
+def test_option_explicit_name_carries_a_refused_declaration(runner):
+    """An explicit name reaches a declaration the transform cannot name."""
+    seen = []
+
+    def record(ctx, param, value):
+        seen.append(value)
+
+    @click.command()
+    @click.option("--0foo", "zero_foo", expose_value=False, callback=record)
+    def cmd(**kwargs):
+        click.echo(repr(kwargs))
+
+    assert cmd.params[0].name == "zero_foo"
+
+    result = runner.invoke(cmd, ["--0foo", "value"])
+    assert not result.exception
+    assert result.output == "{}\n"
+    assert seen == ["value"]
+
+
+def test_option_name_may_be_a_python_keyword(runner):
+    """``str.isidentifier()`` accepts a keyword, so the check lets one through."""
+    with pytest.warns(DeprecationWarning, match="is a Python keyword"):
+
+        @click.command()
+        @click.option("--from")
+        def cmd(**kwargs):
+            click.echo(repr(kwargs))
+
+    assert cmd.params[0].name == "from"
+
+    result = runner.invoke(cmd, ["--from", "here"])
+    assert not result.exception
+    assert result.output == "{'from': 'here'}\n"
 
 
 def test_flag_duplicate_names(runner):
@@ -1390,10 +1707,8 @@ class _StrictEq:
     ids=["empty-string", "non-string-comparable-object"],
 )
 def test_show_default_with_empty_string(runner, default, expected):
-    """The empty-string check in help rendering must not break on objects
-    whose ``__eq__`` raises for string operands.
-
-    Regression test for https://github.com/pallets/click/issues/3298.
+    """The empty-string check in help rendering must not break on objects whose
+    ``__eq__`` raises for string operands.
     """
     opt = click.Option(["--limit"], default=default, show_default=True)
     ctx = click.Context(click.Command("cli"))
@@ -1578,8 +1893,7 @@ def test_type_from_flag_value():
         # Not passing --foo returns the default value as-is, in its Python type, then
         # converted by the option type. For boolean flags, default=True is a literal
         # value, not a sentinel meaning "activate flag". So it is NOT substituted with
-        # flag_value. See: https://github.com/pallets/click/issues/3111
-        # https://github.com/pallets/click/pull/3239
+        # flag_value.
         ({"type": bool, "default": True, "flag_value": True}, [], True),
         ({"type": bool, "default": True, "flag_value": False}, [], True),
         ({"type": bool, "default": False, "flag_value": True}, [], False),
@@ -1687,9 +2001,6 @@ def test_invalid_flag_definition(runner, args, opts):
 def test_default_dual_option_callback(runner, default, args, expected):
     """Check how default is processed by the callback when options compete for the same
     variable name.
-
-    Reproduction of the issue reported in
-    https://github.com/pallets/click/pull/3030#discussion_r2271571819
 
     .. hint::
         Similar to ``test_basic.py::test_flag_value_dual_options``.
@@ -1974,8 +2285,9 @@ def test_choice_usage_rendering(runner, choices, metavar):
         ([True, False], False, "False"),
         (["foo", 1], "foo", "foo"),
         (["foo", 1], 1, "1"),
-        # Enum choices are rendered as their names, not values.
-        # See: https://github.com/pallets/click/issues/2911
+        # Enum choices are rendered as their names, not values, ``StrEnum`` included: a
+        # name is always a string, and using values for some enum kinds only would be
+        # inconsistent.
         (HashType, HashType.SHA1, "SHA1"),
         # Enum choices allow defaults strings that are their names.
         (HashType, HashType.SHA256, "SHA256"),
@@ -2047,10 +2359,6 @@ class EnumSentinel(enum.Enum):
     def __bool__(self) -> Literal[False]:
         """Force the sentinel to be falsy to make sure it is not caught by Click
         internal implementation.
-
-        Falsy sentinels have been discussed in:
-        https://github.com/pallets/click/pull/3030#pullrequestreview-3106604795
-        https://github.com/pallets/click/pull/3030#pullrequestreview-3108471552
         """
         return False
 
@@ -2122,12 +2430,8 @@ class EnumSentinel(enum.Enum):
     ),
 )
 def test_dual_options_custom_type_sentinel_flag_value(runner, sentinel, args, expected):
-    """Check that an object-based sentinel, used as a flag value, is returned as-is
-    to a custom type that is shared by two options, competing for the same variable
-    name.
-
-    A reproduction of
-    https://github.com/pallets/click/issues/3024#issuecomment-3146511356
+    """Check that an object-based sentinel, used as a flag value, is returned as-is to a
+    custom type that is shared by two options, competing for the same variable name.
     """
 
     class ConfigParamType(click.ParamType):
@@ -2262,12 +2566,7 @@ class Class2:
     ],
 )
 def test_custom_type_flag_value_standalone_option(runner, opt_params, args, expected):
-    """Test how the type and flag_value influence the returned value.
-
-    Cover cases reported in:
-    https://github.com/pallets/click/issues/3024#issuecomment-3146480714
-    https://github.com/pallets/click/issues/2012#issuecomment-892437060
-    """
+    """Test how the type and flag_value influence the returned value."""
 
     @click.command()
     @click.option("--pro", **opt_params)
@@ -2305,10 +2604,8 @@ def test_custom_type_flag_value_standalone_option(runner, opt_params, args, expe
             ["--opt2"],
             EngineType.PRO,
         ),
-        # Exotic flag values like classes are passed through unchanged when no
-        # explicit type is given (UNPROCESSED is auto-detected).
-        # https://github.com/pallets/click/issues/2012
-        # https://github.com/pallets/click/issues/3121
+        # Exotic flag values like classes are passed through unchanged when no explicit
+        # type is given (UNPROCESSED is auto-detected).
         (
             {"flag_value": Class1, "default": True},
             {"flag_value": Class2},
@@ -2330,8 +2627,7 @@ def test_custom_type_flag_value_standalone_option(runner, opt_params, args, expe
         # String and None defaults pass through unchanged.
         ({"flag_value": Class1, "default": "True"}, {"flag_value": Class2}, [], "True"),
         ({"flag_value": Class1, "default": None}, {"flag_value": Class2}, [], None),
-        # To get the classes as-is, we need to specify the type as UNPROCESSED.
-        # https://github.com/pallets/click/issues/3121
+        # An explicit ``type=UNPROCESSED`` gives the same result.
         (
             {"flag_value": Class1, "type": UNPROCESSED, "default": True},
             {"flag_value": Class2, "type": UNPROCESSED},
@@ -2397,11 +2693,6 @@ def test_custom_type_flag_value_dual_options(
 ):
     """Test how flag values are processed with dual options competing for the same
     variable name.
-
-    Reproduce issues reported in:
-    https://github.com/pallets/click/issues/3024#issuecomment-3146508536
-    https://github.com/pallets/click/issues/2012#issue-946471049
-    https://github.com/pallets/click/issues/2012#issuecomment-892437060
     """
 
     @click.command()
@@ -2421,8 +2712,7 @@ def test_custom_type_flag_value_dual_options(
     ("opt_params", "args", "expected"),
     [
         # Class flag_value with default=True and UNPROCESSED: the class itself is
-        # returned, NOT an instance. Regression test for
-        # https://github.com/pallets/click/issues/3121
+        # returned, NOT an instance.
         ({"flag_value": Class1, "type": UNPROCESSED, "default": True}, [], Class1),
         (
             {"flag_value": Class1, "type": UNPROCESSED, "default": True},
@@ -2450,15 +2740,14 @@ def test_custom_type_flag_value_dual_options(
             [],
             re.compile(r"<test_options.Class2 object at 0x[0-9A-Fa-f]+>"),
         ),
-        # Non-callable flag_value with default=True: unaffected by the fix.
+        # Non-callable flag_value with default=True: resolves to flag_value as usual.
         ({"flag_value": "upper", "default": True}, [], "upper"),
         ({"flag_value": "upper", "default": True}, ["--opt"], "upper"),
     ],
 )
 def test_callable_flag_value_not_instantiated(runner, opt_params, args, expected):
     """A callable ``flag_value`` like a class, with ``default=True`` should not be
-    invoked when resolving the default. This is the single-option variant of
-    the regression reported in https://github.com/pallets/click/issues/3121.
+    invoked when resolving the default.
     """
 
     @click.command()
@@ -2492,7 +2781,7 @@ def test_callable_flag_value_default_map(runner):
     result = runner.invoke(cli, [], default_map={"value": "from-map"})
     assert result.output == repr("from-map")
 
-    # Callable in default_map is still invoked (not suppressed by the fix).
+    # Callable in default_map is still invoked, unlike the auto-aligned flag_value.
     result = runner.invoke(cli, [], default_map={"value": lambda: "lazy-map"})
     assert result.output == repr("lazy-map")
 
@@ -2582,10 +2871,8 @@ def test_callable_flag_value_get_default_override(
 
 
 def test_flag_value_not_stringified_for_custom_types(runner):
-    """Non-basic flag_value types are passed through unchanged without
-    requiring ``type=click.UNPROCESSED``.
-
-    Regression test for https://github.com/pallets/click/issues/2012
+    """Non-basic flag_value types are passed through unchanged without requiring
+    ``type=click.UNPROCESSED``.
     """
 
     @click.command()
@@ -2640,10 +2927,8 @@ def test_flag_value_not_stringified_for_custom_types(runner):
 def test_custom_type_container_flag_value(
     runner, container_type, flag_value, default, default_output, flag_output
 ):
-    """Check that container types are correctly handled as a type, a flag value
-    and a default.
-
-    Reproduces https://github.com/pallets/click/issues/2610
+    """Check that container types are correctly handled as a type, a flag value and a
+    default.
     """
 
     @click.command()
@@ -2671,12 +2956,10 @@ def test_custom_type_container_flag_value(
     ("default", "args", "expected"),
     [
         # default=None: 3-state pattern (e.g. Flask --reload/--no-reload).
-        # https://github.com/pallets/click/issues/3024
         (None, [], None),
         (None, ["--flag"], True),
         (None, ["--no-flag"], False),
         # default=True: literal value, not substituted with flag_value.
-        # https://github.com/pallets/click/issues/3111
         (True, [], True),
         (True, ["--flag"], True),
         (True, ["--no-flag"], False),
@@ -2702,9 +2985,8 @@ def test_bool_flag_pair_default(runner, default, args, expected):
 @pytest.mark.parametrize(
     ("opts", "args", "expected"),
     [
-        # #3403 reproducer: enable/disable pair with explicit ``default=True``
-        # on the positive flag, declared after (inner decorator) the negative.
-        # https://github.com/pallets/click/issues/3403
+        # The documented enable/disable pair: explicit ``default=True`` on the positive
+        # flag, declared after (inner decorator) the negative.
         pytest.param(
             [
                 ("--without-xyz", {"flag_value": False}),
@@ -2712,7 +2994,7 @@ def test_bool_flag_pair_default(runner, default, args, expected):
             ],
             [],
             True,
-            id="3403-reproducer-no-args",
+            id="explicit-default-inner-no-args",
         ),
         pytest.param(
             [
@@ -2721,7 +3003,7 @@ def test_bool_flag_pair_default(runner, default, args, expected):
             ],
             ["--with-xyz"],
             True,
-            id="3403-reproducer-with-only",
+            id="explicit-default-inner-with-only",
         ),
         pytest.param(
             [
@@ -2730,7 +3012,7 @@ def test_bool_flag_pair_default(runner, default, args, expected):
             ],
             ["--without-xyz"],
             False,
-            id="3403-reproducer-without-only",
+            id="explicit-default-inner-without-only",
         ),
         # When both flags are passed, the parser keeps the last value seen.
         pytest.param(
@@ -2740,7 +3022,7 @@ def test_bool_flag_pair_default(runner, default, args, expected):
             ],
             ["--with-xyz", "--without-xyz"],
             False,
-            id="3403-reproducer-with-then-without",
+            id="explicit-default-inner-with-then-without",
         ),
         pytest.param(
             [
@@ -2749,7 +3031,7 @@ def test_bool_flag_pair_default(runner, default, args, expected):
             ],
             ["--without-xyz", "--with-xyz"],
             True,
-            id="3403-reproducer-without-then-with",
+            id="explicit-default-inner-without-then-with",
         ),
         # Order-independence: explicit ``default=True`` on the OUTER
         # decorator (declared first) must produce the same behavior.
@@ -2783,8 +3065,9 @@ def test_bool_flag_pair_default(runner, default, args, expected):
             False,
             id="explicit-default-false-on-negative",
         ),
-        # Explicit ``default=True`` on the negative flag is unusual but
-        # legal: post-#3239, it is a literal Python value, not a sentinel.
+        # Explicit ``default=True`` on the negative flag is unusual but legal: for a
+        # boolean flag, ``default=True`` is a literal value, not substituted with
+        # ``flag_value``.
         pytest.param(
             [
                 ("--with-xyz", {"flag_value": True}),
@@ -2936,10 +3219,8 @@ def test_bool_flag_pair_default(runner, default, args, expected):
 def test_bool_flag_group_competition(runner, opts, args, expected):
     """Competing boolean flags sharing a single parameter name.
 
-    Verifies the arbitration rules between options that target the same
-    variable name in a feature-switch group.
-
-    Regression test for https://github.com/pallets/click/issues/3403
+    Verifies the arbitration rules between options that target the same variable name in
+    a feature-switch group.
     """
 
     @click.command()
@@ -3016,7 +3297,6 @@ def test_bool_flag_group_competition_with_default_map(
 @pytest.mark.parametrize(
     ("opts", "args", "invoke_kwargs", "expected_value", "expected_source"),
     [
-        # https://github.com/pallets/click/issues/3458
         pytest.param(
             [
                 ("--without-xyz", {"flag_value": False}),
@@ -3055,10 +3335,7 @@ def test_bool_flag_group_competition_with_default_map(
 def test_bool_flag_group_parameter_source(
     runner, opts, args, invoke_kwargs, expected_value, expected_source
 ):
-    """``get_parameter_source()`` stays correct for feature-switch groups.
-
-    Regression test for https://github.com/pallets/click/issues/3458.
-    """
+    """``get_parameter_source()`` stays correct for feature-switch groups."""
 
     @click.command()
     @click.pass_context
@@ -3078,9 +3355,9 @@ def test_bool_flag_group_parameter_source(
 @pytest.mark.parametrize(
     ("opts", "args", "expected"),
     [
-        # Non-boolean feature switch group: classic --upper/--lower
-        # pattern. The option with ``default=True`` acts as the default
-        # via the substitution rule (#3239) for non-boolean ``flag_value``.
+        # Non-boolean feature switch group: classic --upper/--lower pattern. The option
+        # with ``default=True`` acts as the default via the substitution rule for
+        # non-boolean ``flag_value``.
         pytest.param(
             [
                 ("--upper", {"flag_value": "upper", "default": True}),
@@ -3291,10 +3568,10 @@ def test_bool_flag_group_parameter_source(
             "second",
             id="both-explicit-defaults-string-last-wins",
         ),
-        # Mixed boolean and non-boolean ``flag_value`` in the same group
-        # is allowed. Both options here carry an explicit default, so last-wins
-        # picks the option declared last regardless of value type. The boolean
-        # ``default=False`` is a literal value (post-#3239), not a sentinel.
+        # Mixed boolean and non-boolean ``flag_value`` in the same group is allowed.
+        # Both options here carry an explicit default, so last-wins picks the option
+        # declared last regardless of value type. The boolean ``default=False`` passes
+        # through literally, like the string default.
         pytest.param(
             [
                 ("--bool-flag", {"flag_value": True, "default": False}),
@@ -3571,10 +3848,10 @@ def test_flag_group_competition_four_flags(runner, opts, args, expected):
             False,
             id="auto-envvar-prefix-loses-to-cmdline",
         ),
-        # ``Sentinel.UNSET`` in ``default_map`` must be skipped (#3224
-        # carve-out): the lookup falls through to the parameter default.
-        # Inside a feature switch group, the explicit ``default=True`` on
-        # ``--with-xyz`` then wins over the sibling's auto-``False``.
+        # ``Sentinel.UNSET`` in ``default_map`` must be skipped: the lookup falls
+        # through to the parameter default. Inside a feature switch group, the explicit
+        # ``default=True`` on ``--with-xyz`` then wins over the sibling's
+        # auto-``False``.
         pytest.param(
             {},
             {"enable_xyz": UNSET},
@@ -3624,10 +3901,8 @@ def test_flag_group_competition_envvar_prefix_and_unset_default_map(
     ],
 )
 def test_flag_value_on_option_with_zero_or_one_args(flag_type, args, expect_output):
-    """An option with flag_value and is_flag=False can be
-    omitted or used with 0 or 1 args.
-
-    Regression test for https://github.com/pallets/click/issues/3084
+    """An option with flag_value and is_flag=False can be omitted or used with 0 or 1
+    args.
     """
     if flag_type is str:
         flagopt = click.option(

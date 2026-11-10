@@ -1,6 +1,34 @@
-## Version 8.5.1
+## Version 8.6.0
 
 Unreleased
+
+- A parameter name that is not a valid Python identifier, or that is a Python
+  keyword, is deprecated and raises `TypeError` in Click 9.0. {pr}`3866`
+- An {class}`Option` name written as a Python identifier is deprecated when it
+  is not already lower-cased. {pr}`3866`
+- Add {attr}`Parameter.spec`, which returns how the user spells the parameter on
+  the command line: `--times` for an option declared as `-t`, `--times`, and
+  `FILENAME` for an argument declared as `filename`. {pr}`3877`
+- Move {meth}`get_help_spec` from {class}`Option` to {class}`Parameter`, and give
+  {class}`Argument` an override that returns its metavar. {pr}`3877`
+- Error messages and deprecation warnings name an option by its spec instead of
+  its internal name, so they read `The option '--my-option' is deprecated.` where
+  they read `The option 'my_option' is deprecated.` before. {pr}`3877`
+- {attr}`Parameter.human_readable_name` is deprecated and will be removed in
+  Click 9.0. Use {attr}`Parameter.spec` instead. It returned the internal name
+  for options, so its value changes from `my_option` to `--my-option`. Click no
+  longer reads it, and a subclass that overrides it gets a warning when the class
+  is defined. {pr}`3877`
+- With `echo_stdin=True`, {class}`CliRunner` echoes the `\x04` and `\x1a`
+  `<stdin>` bytes to `<stdout>` as `^D` and `^Z`, and no longer passes them to
+  the command. {pr}`3878`
+- {meth}`CliRunner.invoke` accepts a new `context_settings` argument, to allow
+  passing settings to the {class}`Context` of the command which cannot be given as extra
+  keyword arguments like `color`. {issue}`2110` {pr}`3896`
+
+## Version 8.5.1
+
+Released 2026-11-09
 
 - Fix `copy.deepcopy()` and `pickle` on a `Parameter`, `Option` or `Command`. {pr}`3805`
 - A `KeyboardInterrupt` arriving while `Command.main()` reports an abort or an error,
@@ -18,6 +46,19 @@ Unreleased
   `type` callable does to a command-line value. {issue}`3036` {pr}`3808`
 - `path_type` narrows the converted value's type for `convert` and `prompt`.
   {issue}`3822` {pr}`3858`
+- {class}`Parameter` accepts a new `help` argument and {class}`Option` and {class}`Argument`
+  inherits it. {meth}`Parameter.to_info_dict` now reports `help` for every kind of parameter.
+  {pr}`3861`
+- A command's short help no longer stops at an abbreviation such as `vs.` or `e.g.`
+  inside the first sentence. A period ends the sentence only when it closes the text
+  or the next word does not start in lowercase. {pr}`3865`
+- With `show_envvar=True`, an option's error message now prints all variables of an
+  `envvar` sequence instead of the `repr` of the sequence. {pr}`3884`
+- An empty `envvar`, such as `[]` or `""`, shows the same help and error message as
+  no `envvar` when `show_envvar=True`. The help screen used to show `[env var: ]`.
+  {pr}`3884`
+- Align command's deprecated help text to options and arguments: do not translate the
+  command's own help text, only the `(DEPRECATED)` label. {pr}`3901`
 
 ## Version 8.5.0
 
@@ -41,8 +82,7 @@ Released 2026-08-24
   convention. {issue}`2877` {pr}`3642`
 - Add {func}`custom_version_option`, a `--version` option whose output is
   produced by a callback, covering cases {func}`version_option` intentionally
-  does not. The feature set of {func}`version_option` is now frozen; see
-  [discussion #3527](https://github.com/pallets/click/discussions/3527). {pr}`3581`
+  does not. The feature set of {func}`version_option` is now frozen. {pr}`3581`
 - `style()` and `secho()` no longer silently drop the 256-color index `0`
   (black) passed as `fg` or `bg`, and now validate color arguments. Invalid
   colors raise a `ValueError` instead of a `TypeError`. {pr}`3677`
