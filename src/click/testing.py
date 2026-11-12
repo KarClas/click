@@ -28,6 +28,15 @@ else:
     CaptureMode: t.TypeAlias = t.Literal["sys", "fd"]  # pyright: ignore[reportRedeclaration]
 ExceptionInfo: t.TypeAlias = tuple[type[BaseException], BaseException, TracebackType]
 
+# Translation table for EchoingStdin to print the bytes that end `<stdin>` in a
+# terminal. Both are recognized on all platforms.
+_CONTROL_ECHO = {
+    # Ctrl+D on Unix.
+    b"\x04": b"^D\n",
+    # Ctrl+Z on Windows.
+    b"\x1a": b"^Z\n",
+}
+
 
 class EchoingStdin:
     _input: t.BinaryIO
@@ -43,8 +52,20 @@ class EchoingStdin:
         return getattr(self._input, x)
 
     def _echo(self, rv: bytes) -> bytes:
+        """Echo ``rv`` to `<stdout>` and return what the reader of `<stdin>` gets.
+
+        A byte in ``_CONTROL_ECHO`` is echoed with caret-leading notation (``^...``) and
+        removed from the returned value. A string made only of such bytes is returned as
+        empty.
+        """
+        echo = rv
+
+        for char, caret in _CONTROL_ECHO.items():
+            echo = echo.replace(char, caret)
+            rv = rv.replace(char, b"")
+
         if not self._paused:
-            self._output.write(rv)
+            self._output.write(echo)
 
         return rv
 
@@ -58,10 +79,13 @@ class EchoingStdin:
         return self._echo(self._input.readline(n))
 
     def readlines(self) -> list[bytes]:
-        return [self._echo(x) for x in self._input.readlines()]
+        # A line made only of control bytes comes back empty: it ends
+        # `<stdin>` and is not a line.
+        return [rv for x in self._input.readlines() if (rv := self._echo(x))]
 
     def __iter__(self) -> cabc.Iterator[bytes]:
-        return iter(self._echo(x) for x in self._input)
+        # Skips the same empty line as readlines().
+        return iter(rv for x in self._input if (rv := self._echo(x)))
 
     def __repr__(self) -> str:
         return repr(self._input)
@@ -325,7 +349,9 @@ class CliRunner:
     :param echo_stdin: if this is set to `True`, then reading from `<stdin>` writes
                        to `<stdout>`.  This is useful for showing examples in
                        some circumstances.  Note that regular prompts
-                       will automatically echo the input.
+                       will automatically echo the input. The `<stdin>` bytes
+                       ``\\x04`` and ``\\x1a`` are echoed to `<stdout>` as
+                       ``^D`` and ``^Z``, and are not passed to the command.
     :param catch_exceptions: Whether to catch any exceptions other than
                              ``SystemExit`` when running :meth:`~CliRunner.invoke`.
     :param capture: Selects the output capture strategy. ``sys`` (default)
@@ -336,6 +362,10 @@ class CliRunner:
         ``1`` and ``2`` via :func:`os.dup2` to a temporary file, also catching
         output from stale stream references, C extensions, and subprocesses.
         ``fd`` is not supported on Windows.
+
+    .. versionchanged:: 8.6.0
+        ``echo_stdin`` echoes the `<stdin>` bytes ``\\x04`` and ``\\x1a`` to
+        `<stdout>` as ``^D`` and ``^Z`` and no longer passes them to the command.
 
     .. versionchanged:: 8.4.0
         Added the ``capture`` parameter. The default ``sys`` mode no longer exposes the
@@ -600,6 +630,7 @@ class CliRunner:
         env: cabc.Mapping[str, str | None] | None = None,
         catch_exceptions: bool | None = None,
         color: bool = False,
+        context_settings: cabc.Mapping[str, t.Any] | None = None,
         **extra: t.Any,
     ) -> Result:
         """Invokes a command in an isolated environment.  The arguments are
@@ -622,6 +653,14 @@ class CliRunner:
         :param extra: the keyword arguments to pass to :meth:`main`.
         :param color: whether the output should contain color codes. The
                       application can still override this explicitly.
+        :param context_settings: settings to pass to the
+            :class:`~click.Context` of the command. They take precedence
+            over the ``context_settings`` of the command. Unlike ``extra``,
+            they can hold a setting named like a parameter of this method,
+            such as ``color``.
+
+        .. versionchanged:: 8.6.0
+            Added the ``context_settings`` parameter.
 
         .. versionadded:: 8.2
             The result object has the ``output_bytes`` attribute with
@@ -683,7 +722,12 @@ class CliRunner:
                 prog_name = self.get_default_prog_name(cli)
 
             try:
-                return_value = cli.main(args=args or (), prog_name=prog_name, **extra)
+                return_value = cli.main(
+                    args=args or (),
+                    prog_name=prog_name,
+                    **extra,
+                    **(context_settings or {}),
+                )
             except SystemExit as e:
                 exc_info = sys.exc_info()
                 e_code = t.cast("int | t.Any | None", e.code)
